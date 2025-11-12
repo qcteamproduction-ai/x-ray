@@ -1,0 +1,172 @@
+import streamlit as st
+import cv2
+import time
+import serial
+from ultralytics import YOLO
+from collections import deque
+
+# === Custom CSS ===
+st.markdown("""
+    <style>
+    #MainMenu, footer, header {visibility: hidden;}
+    .block-container {padding: 0.5rem 1rem; max-width: 100%;}
+    .status-bar {width: 100vw; margin-left: calc(-50vw + 50%); padding: 1.5rem 0; text-align: center;
+                 box-shadow: 0 4px 10px rgba(0, 0, 0, 0.2); transition: all 0.3s ease;}
+    @keyframes pulse {0%,100%{opacity:1;} 50%{opacity:0.85;}}
+    @keyframes glow {0%{text-shadow:0 0 5px rgba(255,255,255,0.6);}
+                     50%{text-shadow:0 0 25px rgba(255,255,255,1);}
+                     100%{text-shadow:0 0 5px rgba(255,255,255,0.6);}}
+    .status-danger {animation: pulse 1.5s infinite, glow 2s infinite;}
+    .status-pass {animation: glow 3s infinite;}
+    .frame-container {border-radius: 8px; overflow: hidden; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.15);
+                      background: #f8f9fa; padding: 0.5rem; height: 100%;}
+    .info-card {background: #f8f9fa; padding: 1rem; border-radius: 8px; border-left: 3px solid #667eea;
+                margin-bottom: 1rem; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);}
+    </style>
+""", unsafe_allow_html=True)
+
+# === Inisialisasi Serial Connection ===
+try:
+    ser = serial.Serial('COM3', 9600, timeout=1)
+    time.sleep(2)  # Tunggu ESP32 siap
+    serial_status = "● Connected"
+    serial_color = "#28a745"
+except Exception as e:
+    ser = None
+    serial_status = "● Disconnected"
+    serial_color = "#dc3545"
+    st.warning(f"ESP32 not connected: {e}")
+
+# === Load YOLO model ===
+model = YOLO("newest-x-ray-640.pt")
+
+# === Open camera ===
+cap = cv2.VideoCapture(0)
+
+history = deque(maxlen=5)
+status_placeholder = st.empty()
+col_left, col_right = st.columns([1, 1])
+
+with col_left:
+    st.markdown("<div class='frame-container'>", unsafe_allow_html=True)
+    frame_placeholder = st.empty()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with col_right:
+    st.markdown(f"""
+        <div class='info-card'>
+            <h3>Detection Model</h3>
+            <p><strong>Model:</strong> YOLOv8n BiFPN<br>
+            <strong>Type:</strong> Object Detection</p>
+        </div>
+        <div class='info-card'>
+            <h3>System Status</h3>
+            <p><strong>Camera:</strong> ● Active<br>
+            <strong>Model:</strong> ● Loaded<br>
+            <strong>Stream:</strong> ● Running<br>
+            <strong style='color:{serial_color};'>ESP32:</strong> {serial_status}</p>
+        </div>
+        <div class='info-card'>
+            <h3>Status Legend</h3>
+            <p><strong style='color:#28a745;'>PASS:</strong> No material detected<br>
+            <strong style='color:#dc3545;'>DANGER:</strong> Material detected<br>
+            <strong>Relay:</strong> Activates for 5 seconds<br>
+            <strong>Buffer:</strong> 3-frame consistency check</p>
+        </div>
+    """, unsafe_allow_html=True)
+
+# === Variabel kontrol ===
+detection_count = 0
+danger_start_time = None       # waktu mulai indikator DANGER
+danger_duration = 5            # durasi nyala 5 detik
+relay_triggered = False        # flag untuk mencegah trigger berulang
+
+# === Fungsi untuk trigger relay ===
+def trigger_relay():
+    if ser:
+        try:
+            ser.write(b'ON\n')
+            return True
+        except Exception as e:
+            st.error(f"Failed to trigger relay: {e}")
+            return False
+    return False
+
+# === Loop utama ===
+try:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            st.error("Camera connection lost. Please check your camera.")
+            break
+
+        results = model.predict(frame, imgsz=1280, verbose=False)
+        detected = False
+
+        for r in results:
+            for c in r.boxes.cls:
+                class_name = model.names[int(c)]
+                if class_name.lower() == "material":
+                    detected = True
+
+        # Simpan ke buffer
+        history.append(detected)
+
+        # === Logika status ===
+        current_time = time.time()
+
+        # Jika 3 frame terakhir mendeteksi "Material"
+        if all(history):
+            danger_start_time = current_time  # mulai nyalakan indikator DANGER
+            relay_triggered = False           # reset flag untuk trigger baru
+            history.clear()                   # reset buffer agar tidak langsung nyala lagi
+
+        # Jika sedang dalam masa DANGER (5 detik)
+        if danger_start_time and (current_time - danger_start_time) < danger_duration:
+            status = "DANGER"
+            status_text = "⚠ RELAY ACTIVATED"
+            bg_gradient = "linear-gradient(135deg, #dc3545 0%, #c82333 100%)"
+            animation_class = "status-danger"
+            
+            # Trigger relay hanya sekali
+            if not relay_triggered:
+                if trigger_relay():
+                    relay_triggered = True
+                    st.toast("🚨 Relay activated!", icon="⚠️")
+        else:
+            status = "PASS"
+            status_text = ""
+            bg_gradient = "linear-gradient(135deg, #28a745 0%, #218838 100%)"
+            animation_class = "status-pass"
+            # Reset timer jika sudah lewat 5 detik
+            if danger_start_time and (current_time - danger_start_time) >= danger_duration:
+                danger_start_time = None
+                relay_triggered = False
+
+        # === Tampilkan status ===
+        status_placeholder.markdown(f"""
+            <div class='status-bar {animation_class}' style='background: {bg_gradient};'>
+                <div style='display:flex; align-items:center; justify-content:center; gap:1rem;'>
+                    <div style='text-align:center;'>
+                        <h1 style='color:white; margin:0; font-size:4rem; font-weight:1000;
+                                   text-transform:uppercase; letter-spacing:6px;
+                                   text-shadow:0 0 10px rgba(0,0,0,0.8),
+                                                0 0 25px rgba(0,0,0,0.6),
+                                                2px 2px 8px rgba(0,0,0,0.4);'>
+                            {status}
+                        </h1>
+                        <p style='color:white; margin:0; font-size:1.2rem; opacity:0.9;'>{status_text}</p>
+                    </div>
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+
+        annotated_frame = results[0].plot()
+        frame_placeholder.image(annotated_frame, channels="BGR", use_container_width=True)
+
+except KeyboardInterrupt:
+    pass
+finally:
+    cap.release()
+    if ser:
+        ser.close()
