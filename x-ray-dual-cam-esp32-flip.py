@@ -1,0 +1,210 @@
+import streamlit as st
+import cv2
+import time
+from ultralytics import YOLO
+from collections import deque
+
+# === Custom CSS ===
+st.markdown("""
+    <style>
+    #MainMenu, footer, header {visibility: hidden;}
+    .block-container {padding: 0.5rem 1rem; max-width: 100%;}
+    .status-bar {width: 100vw; margin-left: calc(-50vw + 50%); padding: 1.5rem 0; text-align: center;
+                 box-shadow: 0 4px 10px rgba(0, 0, 0, 0.2); transition: all 0.3s ease;}
+    @keyframes pulse {0%,100%{opacity:1;} 50%{opacity:0.85;}}
+    @keyframes glow {0%{text-shadow:0 0 5px rgba(255,255,255,0.6);}
+                     50%{text-shadow:0 0 25px rgba(255,255,255,1);}
+                     100%{text-shadow:0 0 5px rgba(255,255,255,0.6);}}
+    .status-danger {animation: pulse 1.5s infinite, glow 2s infinite;}
+    .status-pass {animation: glow 3s infinite;}
+    .frame-container {border-radius: 8px; overflow: hidden; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.15);
+                      background: #f8f9fa; padding: 0.5rem; height: 100%;}
+    .camera-label {text-align: center; font-size: 1.5rem; font-weight: bold; 
+                   margin-bottom: 1rem; color: #667eea;}
+    .stButton > button {
+        width: 100%;
+        border-radius: 8px;
+        font-weight: bold;
+        transition: all 0.3s ease;
+    }
+    .stButton > button:hover {
+        transform: scale(1.05);
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+# === Initialize session state for camera indices ===
+if 'cam1_index' not in st.session_state:
+    st.session_state.cam1_index = 0  # Default: kamera belakang
+if 'cam2_index' not in st.session_state:
+    st.session_state.cam2_index = 1  # Default: kamera kedua
+if 'cam1_available' not in st.session_state:
+    st.session_state.cam1_available = [0, 1]  # Available camera indices
+if 'cam2_available' not in st.session_state:
+    st.session_state.cam2_available = [0, 1]
+
+# === Load YOLO model ===
+@st.cache_resource
+def load_model():
+    return YOLO("newest-x-ray-model.pt")
+
+model = load_model()
+
+# === Function to switch camera ===
+def flip_camera(camera_num):
+    if camera_num == 1:
+        # Cycle through available cameras for Camera 1
+        current_idx = st.session_state.cam1_index
+        available = st.session_state.cam1_available
+        current_pos = available.index(current_idx) if current_idx in available else 0
+        next_pos = (current_pos + 1) % len(available)
+        st.session_state.cam1_index = available[next_pos]
+    else:
+        # Cycle through available cameras for Camera 2
+        current_idx = st.session_state.cam2_index
+        available = st.session_state.cam2_available
+        current_pos = available.index(current_idx) if current_idx in available else 0
+        next_pos = (current_pos + 1) % len(available)
+        st.session_state.cam2_index = available[next_pos]
+
+# === Open cameras ===
+cap1 = cv2.VideoCapture(st.session_state.cam1_index)
+cap2 = cv2.VideoCapture(st.session_state.cam2_index)
+
+if not cap1.isOpened() or not cap2.isOpened():
+    st.error("Error: Could not open one or both cameras. Please check your camera connections.")
+    st.stop()
+
+# Set camera resolution
+cap1.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap1.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+cap2.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap2.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+# === History buffers for both cameras ===
+history_cam1 = deque(maxlen=3)
+history_cam2 = deque(maxlen=3)
+
+# === Status placeholder ===
+status_placeholder = st.empty()
+
+# === Create two columns for cameras ===
+col_left, col_right = st.columns([1, 1])
+
+with col_left:
+    st.markdown("<p class='camera-label'>📹 Camera 1</p>", unsafe_allow_html=True)
+    if st.button("🔄 Flip Camera 1", key="flip_cam1"):
+        flip_camera(1)
+        cap1.release()
+        st.rerun()
+    st.markdown("<div class='frame-container'>", unsafe_allow_html=True)
+    frame_placeholder_1 = st.empty()
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.caption(f"Active Camera Index: {st.session_state.cam1_index}")
+
+with col_right:
+    st.markdown("<p class='camera-label'>📹 Camera 2</p>", unsafe_allow_html=True)
+    if st.button("🔄 Flip Camera 2", key="flip_cam2"):
+        flip_camera(2)
+        cap2.release()
+        st.rerun()
+    st.markdown("<div class='frame-container'>", unsafe_allow_html=True)
+    frame_placeholder_2 = st.empty()
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.caption(f"Active Camera Index: {st.session_state.cam2_index}")
+
+# === Control variables ===
+danger_start_time = None
+danger_duration = 5
+
+# === Main loop ===
+while True:
+    # Read from both cameras
+    ret1, frame1 = cap1.read()
+    ret2, frame2 = cap2.read()
+    
+    if not ret1 or not ret2:
+        st.error("Camera connection lost. Please check your cameras.")
+        break
+
+    # === Process Camera 1 ===
+    results1 = model.predict(frame1, imgsz=1280, verbose=False)
+    detected_cam1 = False
+    
+    for r in results1:
+        for c in r.boxes.cls:
+            class_name = model.names[int(c)]
+            if class_name.lower() == "material":
+                detected_cam1 = True
+                break
+
+    # === Process Camera 2 ===
+    results2 = model.predict(frame2, imgsz=1280, verbose=False)
+    detected_cam2 = False
+    
+    for r in results2:
+        for c in r.boxes.cls:
+            class_name = model.names[int(c)]
+            if class_name.lower() == "material":
+                detected_cam2 = True
+                break
+
+    # Save to buffers
+    history_cam1.append(detected_cam1)
+    history_cam2.append(detected_cam2)
+
+    # === Status logic (DANGER if either camera detects material consistently) ===
+    current_time = time.time()
+
+    # If either camera detects "Material" in all 3 recent frames
+    if all(history_cam1) or all(history_cam2):
+        danger_start_time = current_time
+        if all(history_cam1):
+            history_cam1.clear()
+        if all(history_cam2):
+            history_cam2.clear()
+
+    # Display status based on danger timer
+    if danger_start_time and (current_time - danger_start_time) < danger_duration:
+        status = "DANGER"
+        status_text = ""
+        bg_gradient = "linear-gradient(135deg, #dc3545 0%, #c82333 100%)"
+        animation_class = "status-danger"
+    else:
+        status = "PASS"
+        status_text = ""
+        bg_gradient = "linear-gradient(135deg, #28a745 0%, #218838 100%)"
+        animation_class = "status-pass"
+        # Reset timer if 5 seconds passed
+        if danger_start_time and (current_time - danger_start_time) >= danger_duration:
+            danger_start_time = None
+
+    # === Display status bar ===
+    status_placeholder.markdown(f"""
+        <div class='status-bar {animation_class}' style='background: {bg_gradient};'>
+            <div style='display:flex; align-items:center; justify-content:center; gap:1rem;'>
+                <div style='text-align:center;'>
+                    <h1 style='color:white; margin:0; font-size:4rem; font-weight:1000;
+                               text-transform:uppercase; letter-spacing:6px;
+                               text-shadow:0 0 10px rgba(0,0,0,0.8),
+                                            0 0 25px rgba(0,0,0,0.6),
+                                            2px 2px 8px rgba(0,0,0,0.4);'>
+                        {status}
+                    </h1>
+                    <p style='color:white; margin:0; font-size:1.2rem; opacity:0.9;'>{status_text}</p>
+                </div>
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+
+    # === Display annotated frames ===
+    annotated_frame1 = results1[0].plot()
+    annotated_frame2 = results2[0].plot()
+    
+    frame_placeholder_1.image(annotated_frame1, channels="BGR", use_container_width=True)
+    frame_placeholder_2.image(annotated_frame2, channels="BGR", use_container_width=True)
+
+# Release cameras
+cap1.release()
+cap2.release()
